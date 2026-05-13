@@ -32,13 +32,20 @@ from . import xml_parser as xp
 def _local_matrix(node: xp.SceneNode):
     import mathutils
     loc = mathutils.Matrix.Translation(node.translation)
+    # GIANTS uses intrinsic ZY'X'' Euler (rotate Z first, then Y', then X''),
+    # which is equivalent to matrix M = Rz(z) @ Ry(y) @ Rx(x). Blender's Euler
+    # order naming reads RIGHT-TO-LEFT in matrix multiplication, so 'ZYX' would
+    # produce Rx @ Ry @ Rz (wrong); 'XYZ' produces Rz @ Ry @ Rx (correct for
+    # GIANTS). This only matters for joints with multiple non-zero rotation
+    # components (cow/goat spine_01 is (0, -90, 0) so single-axis is unaffected,
+    # but pig spine_01 is (-90, -88.5, 90) where the difference is huge).
     rot = mathutils.Euler(
         (
             math.radians(node.rotation[0]),
             math.radians(node.rotation[1]),
             math.radians(node.rotation[2]),
         ),
-        'ZYX',
+        'XYZ',
     ).to_matrix().to_4x4()
     sx, sy, sz = node.scale
     scale = mathutils.Matrix.Diagonal((sx, sy, sz, 1.0))
@@ -237,15 +244,25 @@ def build_armature(
     arm_data = bpy.data.armatures.new(arm_root_node.name)
     arm_obj = bpy.data.objects.new(arm_root_node.name, arm_data)
 
-    # Inherit parent + transform components directly. Going through
-    # matrix_local then changing rotation_mode mutates the rotation in
-    # Blender (mode-change keeps numeric values but re-interprets them),
-    # so we copy each component explicitly with rotation_mode first.
-    arm_obj.parent = arm_root_empty.parent
+    # Capture the world transform the bones should inherit (this is whatever
+    # axis conversion + parent-chain transforms the source empty had).
+    bpy.context.view_layer.update()
+    src_world = arm_root_empty.matrix_world.copy()
+    src_parent = arm_root_empty.parent
     arm_obj.rotation_mode = arm_root_empty.rotation_mode
-    arm_obj.location = arm_root_empty.location.copy()
-    arm_obj.rotation_euler = arm_root_empty.rotation_euler.copy()
-    arm_obj.scale = arm_root_empty.scale.copy()
+
+    # Approach: bake src_world INTO each bone's head/tail (in matrices below)
+    # and leave arm_obj itself at identity world. This sidesteps Blender's
+    # parent-inverse / depsgraph-staleness issues entirely — the armature
+    # object can have any local TRS; what we draw is determined by the
+    # bone positions themselves, which we put in absolute world coords.
+    arm_obj.parent = None
+    arm_obj.matrix_world = mathutils.Matrix.Identity(4)
+    bpy.context.view_layer.update()
+
+    # Pre-multiply every bone matrix by src_world so head/tail extraction below
+    # produces world-space coordinates directly.
+    matrices = {nid: src_world @ m for nid, m in matrices.items()}
 
     # Same collection
     for col in list(arm_root_empty.users_collection):
@@ -385,5 +402,31 @@ def build_armature(
     arm_obj["_i3d_bone_name_to_node_id"] = bone_name_to_node_id
     # And the inverse: nodeId -> bone name (string keys for json-friendly storage)
     arm_obj["_i3d_node_id_to_bone_name"] = {str(k): v for k, v in name_of.items()}
+
+    # Preserve each joint's ORIGINAL i3d transform on the bone itself. Blender's
+    # head/tail/roll is a lossy proxy for a Maya-style joint matrix (it can't
+    # represent +X-along-bone orientation exactly without reshaping the bone),
+    # so any export that wants to round-trip rotations needs the source values.
+    # Stored on the Bone (armature data) so they survive save/reload.
+    for nid in bone_ids_ordered:
+        bn = name_of.get(nid)
+        if bn is None or bn not in arm_data.bones:
+            continue
+        src = by_id[nid]
+        bone = arm_data.bones[bn]
+        bone["_i3d_node_id"] = nid
+        bone["_i3d_translation"] = list(src.translation)
+        bone["_i3d_rotation_zyx_deg"] = list(src.rotation)
+        bone["_i3d_scale"] = list(src.scale)
+
+    # Re-parent the armature into the original hierarchy slot (e.g. under
+    # pigSkeleton) so re-export keeps the same TG layout. Bone head/tail are
+    # already in world coordinates so we need arm_obj.matrix_world to stay
+    # identity after parenting; setting matrix_parent_inverse to the parent's
+    # inverse-world achieves that.
+    if src_parent is not None:
+        bpy.context.view_layer.update()
+        arm_obj.parent = src_parent
+        arm_obj.matrix_parent_inverse = src_parent.matrix_world.inverted()
 
     return arm_obj, name_of

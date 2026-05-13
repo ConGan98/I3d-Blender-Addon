@@ -130,7 +130,7 @@ def apply_animation(
             rest_kf = anim_kfs[0]
             rest_mat = (
                 Matrix.Translation(rest_kf.location)
-                @ Euler(rest_kf.rotation_euler, 'ZYX').to_matrix().to_4x4()
+                @ Euler(rest_kf.rotation_euler, 'XYZ').to_matrix().to_4x4()
             )
             inv_rest = rest_mat.inverted()
 
@@ -144,7 +144,7 @@ def apply_animation(
                     max_frame = frame
                 kf_mat = (
                     Matrix.Translation(kf.location)
-                    @ Euler(kf.rotation_euler, 'ZYX').to_matrix().to_4x4()
+                    @ Euler(kf.rotation_euler, 'XYZ').to_matrix().to_4x4()
                 )
                 delta = inv_rest @ kf_mat
                 d_loc = delta.to_translation()

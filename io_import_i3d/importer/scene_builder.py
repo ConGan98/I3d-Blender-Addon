@@ -77,7 +77,7 @@ def build_empties(
                     math.radians(r.rotation[1]),
                     math.radians(r.rotation[2]),
                 ),
-                'ZYX',
+                'XYZ',
             ).to_matrix().to_4x4()
             sx, sy, sz = r.scale
             scale_m = Matrix.Diagonal((sx, sy, sz, 1.0))
@@ -85,8 +85,8 @@ def build_empties(
             new_local = R @ original_local
             new_loc, new_rot_q, new_scale = new_local.decompose()
             obj.location = new_loc
-            obj.rotation_mode = 'ZYX'
-            obj.rotation_euler = new_rot_q.to_euler('ZYX')
+            obj.rotation_mode = 'XYZ'
+            obj.rotation_euler = new_rot_q.to_euler('XYZ')
             obj.scale = new_scale
 
     return root, nodes_by_id
@@ -114,11 +114,11 @@ def _make_empty_for_node(node: xp.SceneNode) -> bpy.types.Object:
         obj.hide_render = True
     obj.empty_display_size = 0.1
 
-    obj.rotation_mode = 'ZYX'
+    obj.rotation_mode = 'XYZ'
     obj.location = node.translation
     obj.rotation_euler = Euler(
         axis_convert.degrees_to_radians_zyx(node.rotation),
-        'ZYX',
+        'XYZ',
     )
     obj.scale = node.scale
     return obj

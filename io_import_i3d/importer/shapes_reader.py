@@ -17,10 +17,14 @@ from .shapes_cipher import CipherStream, FileHeader, I3DCipher
 from .shapes_entity import ShapeData, parse_shape_entity
 
 
-# Donkie supports 2..7. FS25 is 9. We allow 2..9; the cipher itself doesn't
-# vary with version, and shape contents have only minor version-specific
-# branches (tangents from v5, UV densities from v6).
-SUPPORTED_VERSIONS = range(2, 10)
+# Donkie supports 2..7. FS25 base game is v9; some FS25 character/animal
+# assets (horse, goat, waterBuffalo, sheepEwe, pigSow, etc.) ship as v10.
+# The v9 entity layout decodes v10 cleanly — same I3DPart header, subset
+# layout, vertex sections and attachment framing — so we accept 2..10.
+# The cipher itself doesn't vary with version; shape contents have only
+# minor version-specific branches (tangents from v5, UV densities from v6,
+# leading subset u32 + post-subset vtx-compression float from v9).
+SUPPORTED_VERSIONS = range(2, 11)
 
 
 def parse_external_shapes(path: Path | str) -> dict[int, ShapeData]:

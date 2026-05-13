@@ -1,7 +1,13 @@
 """
 GIANTS uses Y-up, right-handed; rotations are intrinsic Euler ZY'X'' in degrees.
-Blender uses Z-up, right-handed; we set rotation_mode='ZYX' on objects/pose-bones
-so the Euler triplet maps directly.
+
+The corresponding matrix is M = R_z(z) @ R_y(y) @ R_x(x). In Blender, the Euler
+order naming reads RIGHT-TO-LEFT in the matrix product, so 'ZYX' would build
+Rx @ Ry @ Rz (wrong for GIANTS); 'XYZ' builds Rz @ Ry @ Rx (correct). We use
+rotation_mode='XYZ' on objects/pose-bones so the Euler triplet from XML maps
+directly to the same matrix GIANTS Editor produces. (Single-axis rotations like
+cow's spine (0, -90, 0) work in either mode, which is why the convention bug
+went unnoticed until pigs/sheep with multi-component joint rotations.)
 
 The Y-up→Z-up conversion is applied as a rotation at the top-level import root;
 all children inherit. The base conversion is +X 90° (maps GIANTS +Y → Blender

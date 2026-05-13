@@ -1,0 +1,112 @@
+i3d Blender importer — update log
+==================================
+
+2026-05-13  Multi-axis joint rotations: Euler convention fix
+------------------------------------------------------------
+
+Symptom:
+  Skeletons imported with the wrong orientation/position for FS25 animals whose
+  joints have rotations with more than one non-zero component — pigSow, sheep,
+  horse, waterBuffalo. The skeleton appeared offset from the body (e.g. floating
+  above and behind the mesh). Cow, goat, and lamb were unaffected because their
+  joint rotations were single-axis (e.g. spine_01 = (0, -90, 0)).
+
+Root cause:
+  The importer used Blender Euler mode 'ZYX' to interpret GIANTS' intrinsic
+  ZY'X'' rotations, on the assumption that the names matched. They don't.
+  Empirically, Blender's `Euler((rx, ry, rz), 'ZYX').to_matrix()` builds
+  M = Rx @ Ry @ Rz (extrinsic ZYX / intrinsic XYZ), NOT M = Rz @ Ry @ Rx
+  (intrinsic ZYX, which is what GIANTS uses).
+
+  Blender Euler order names read right-to-left in matrix multiplication, so:
+    'ZYX' → Rx @ Ry @ Rz   (wrong for GIANTS)
+    'XYZ' → Rz @ Ry @ Rx   (matches GIANTS intrinsic ZY'X'')
+
+  Single-axis rotations are identical under both conventions, which is why the
+  bug went unnoticed on most rigs.
+
+Fix:
+  Changed Euler order from 'ZYX' to 'XYZ' wherever Blender Euler objects
+  interpret GIANTS-side rotations:
+    - io_import_i3d/importer/armature_builder.py: _local_matrix
+    - io_import_i3d/importer/scene_builder.py: _make_empty_for_node + the
+      axis-conversion baking block
+    - io_import_i3d/importer/anim_apply.py: keyframe rest / pose interpretation
+  Documented the convention reasoning in axis_convert.py module docstring.
+
+Verified on pigSow: spine_01 now lands inside the body's back; head/jaw/ear
+bones now follow the snout/forehead instead of floating behind the rear.
+Same fix applies automatically to sheep, horse, waterBuffalo.
+
+
+2026-05-13  v10 .i3d.shapes support
+-----------------------------------
+
+Symptom:
+  Some FS25 animals' main meshes never appeared on import; only the cube empties
+  for Shape nodes remained. Affected files: horse.i3d, goat.i3d, sheepEwe.i3d,
+  pigSow.i3d, waterBuffalo.i3d (and posed variants).
+
+Root cause:
+  shapes_reader.SUPPORTED_VERSIONS was range(2, 10) — rejecting version 10. The
+  exception ("Unsupported .i3d.shapes version 10") was swallowed by the
+  top-level try/except in import_i3d.run, which just logged a warning and left
+  the Shape nodes as empties. Probing v10 files against v9 layout logic showed
+  identical framing — IDs, names, vertex/corner counts, options, attachments
+  all decode cleanly.
+
+Fix:
+  Extended SUPPORTED_VERSIONS to range(2, 11) in
+  io_import_i3d/importer/shapes_reader.py. No layout changes needed.
+
+
+2026-05-13  Preserve source joint TRS on each bone (round-trip fidelity)
+------------------------------------------------------------------------
+
+Why:
+  Blender bones store orientation indirectly via head/tail/roll. The importer
+  computes the tail heuristically (single child → child.head; multi-child →
+  best-aligned-along-+X; leaf → head + dir_x * bone_display_size). That gives a
+  visually reasonable bone but the resulting bone matrix doesn't equal the
+  source joint matrix exactly — any exporter reading the rotation back from
+  Blender will produce ZYX Eulers that differ from the original i3d, and
+  animations referencing those bones will play in the wrong pose space.
+
+Change:
+  After bone creation, each Blender Bone (in armature data) now carries the
+  source i3d values as custom properties:
+    _i3d_node_id
+    _i3d_translation       (3-tuple of floats)
+    _i3d_rotation_zyx_deg  (3-tuple of degrees, intrinsic ZY'X'')
+    _i3d_scale             (3-tuple of floats)
+  These survive save/reload. An exporter can write them straight back without
+  depending on Blender's synthesized tail/roll.
+  See io_import_i3d/importer/armature_builder.py near build_armature's end.
+
+
+--- Notes for future debugging --------------------------------------------
+
+When troubleshooting bone alignment:
+  * Confirm via Blender Python console:
+      import bpy
+      arm = bpy.data.objects['<armature_name>']
+      print(arm.matrix_world)
+      bone = arm.data.bones['<bone_name>']
+      print(bone.head_local, bone.tail_local)
+    head_local is the absolute armature-local rest position — bypasses pose
+    mode and any UI quirks.
+  * arm_obj.matrix_world is set to identity in build_armature; the bone heads
+    carry the full world transform (baked from arm_root_empty.matrix_world).
+    This decouples the alignment from Blender's parent/parent_inverse machinery
+    which can otherwise be stale relative to scene_builder's late rotation
+    updates.
+  * If a bone position disagrees with hand-computed XML walk math, suspect the
+    Euler convention before anything else.
+
+Installation gotcha:
+  The repo's live io_import_i3d/ folder is NOT automatically the running
+  Blender addon. When testing fixes, rebuild io_import_i3d.zip and reinstall
+  via Edit > Preferences > Add-ons > Install from disk. Blender extracts a copy
+  to %APPDATA%\Blender Foundation\Blender\<ver>\scripts\addons\io_import_i3d
+  and uses that copy. Deleting that folder when removing the addon avoids stale
+  code leaking into the next install.

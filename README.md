@@ -20,11 +20,13 @@ Without those details I can't reproduce the bug, and the issue will likely just 
 ## Features
 
 - **Scene import** — full hierarchy from the `.i3d` XML (TransformGroups become Empties, with optional axis conversion to Blender's Z-up).
-- **Meshes** — decrypts `.i3d.shapes` (FS25 v9 cipher) and builds Blender meshes with positions, triangles, normals, UVs, and per-shape materials.
-- **Armature & skinning** — detects the bone set via `skinBindNodeIds`, builds an Armature with derived tail/roll, binds skin weights via vertex groups + Armature modifier without breaking the scene hierarchy.
+- **Meshes** — decrypts `.i3d.shapes` (FS25 v9 and v10 ciphers) and builds Blender meshes with positions, triangles, normals, UVs, and per-shape materials.
+- **Armature & skinning** — detects the bone set via `skinBindNodeIds`, builds an Armature with derived tail/roll, binds skin weights via vertex groups + Armature modifier without breaking the scene hierarchy. Each bone carries its original i3d translation/rotation/scale as custom properties so an exporter can round-trip the joint matrices exactly.
 - **Materials** — Principled BSDF with diffuse/normal/gloss textures resolved through `$data` / `$dataS` paths from the addon preferences.
 - **Round-trip** — drag-and-drop helper to remap node IDs in an exported `.i3d` so it lines up with the original `.i3d.anim`.
 - **Animations (experimental)** — opt-in. The track structure is decoded but the per-keyframe rotation values aren't fully reverse-engineered yet, so motion may look wrong.
+
+See [updates.txt](updates.txt) for the recent fix log.
 
 ## Install
 
