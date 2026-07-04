@@ -35,11 +35,75 @@ from pathlib import Path
 _NODE_KINDS = {"TransformGroup", "Shape", "Light", "Camera"}
 
 _BLENDER_DUP_SUFFIX = re.compile(r"\.\d{3}$")
+_ORDER_PREFIX = re.compile(r"^\d+_")
 
 
 def _strip_dup_suffix(name: str) -> str:
     """Strip Blender's `.001`, `.002`, ... auto-rename suffix (3 digits)."""
     return _BLENDER_DUP_SUFFIX.sub("", name) if name else name
+
+
+def _strip_order_prefix(name: str) -> str:
+    """Strip a leading numeric ordering prefix like `01_`, `02_`.
+
+    Some Blender/GIANTS workflows prefix top-level nodes (`01_cattleSkeleton`,
+    `02_cattleHolstein`) for readability. The original .i3d has the bare name
+    (`cattleSkeleton`), so matching must tolerate the prefix or the skeleton
+    root / mesh-group nodeIds won't be restored and the .anim can't bind.
+    """
+    return _ORDER_PREFIX.sub("", name) if name else name
+
+
+def _name_candidates(name: str):
+    """Yield lookup keys for `name`, most specific first, de-duplicated."""
+    seen = set()
+    for cand in (
+        name,
+        _strip_dup_suffix(name),
+        _strip_order_prefix(name),
+        _strip_order_prefix(_strip_dup_suffix(name)),
+    ):
+        if cand and cand not in seen:
+            seen.add(cand)
+            yield cand
+
+
+def _match_orig_el(el, name_to_orig_el, shapeid_to_orig_el):
+    """Find the original element that an exported node corresponds to.
+
+    Shape nodes are matched by `shapeId` first: the exporter preserves shape
+    references verbatim, whereas Blender mangles duplicate object *names*
+    (`body` → `body.001`) so name-stripping would collapse distinct LOD
+    meshes (`body`, `body1`, `body2`) onto the same original node and clobber
+    their per-node transforms. Everything else (bones/joints, whose names are
+    unique and preserved) matches by name, with the dup-suffix fallback.
+    """
+    if el.tag == "Shape":
+        sid = el.attrib.get("shapeId")
+        if sid:
+            try:
+                m = shapeid_to_orig_el.get(int(sid))
+            except ValueError:
+                m = None
+            if m is not None:
+                return m
+    nm = el.attrib.get("name")
+    if not nm:
+        return None
+    for cand in _name_candidates(nm):
+        if cand in name_to_orig_el:
+            return name_to_orig_el[cand]
+    return None
+
+
+def _orig_node_id(el):
+    v = el.attrib.get("nodeId")
+    if not v:
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        return None
 
 
 def _walk_scene(scene_el):
@@ -49,45 +113,6 @@ def _walk_scene(scene_el):
     for el in scene_el.iter():
         if el.tag in _NODE_KINDS:
             yield el
-
-
-def _build_name_to_id(scene_el):
-    """Returns {name: original_nodeId} from the original .i3d's <Scene>."""
-    out: dict[str, int] = {}
-    for el in _walk_scene(scene_el):
-        nm = el.attrib.get("name")
-        nid = el.attrib.get("nodeId")
-        if not nm or not nid:
-            continue
-        try:
-            out[nm] = int(nid)
-        except ValueError:
-            continue
-    return out
-
-
-def _max_id(name_to_id: dict[str, int]) -> int:
-    return max(name_to_id.values(), default=0)
-
-
-def _build_name_to_transform(scene_el):
-    """Returns {name: {'translation': str, 'rotation': str, 'scale': str}}.
-
-    Captures the ORIGINAL transform attributes verbatim so we can restore
-    them on the exported file, preserving the rest pose that .i3d.anim
-    keyframes were authored against.
-    """
-    out: dict[str, dict[str, str]] = {}
-    for el in _walk_scene(scene_el):
-        nm = el.attrib.get("name")
-        if not nm:
-            continue
-        out[nm] = {
-            "translation": el.attrib.get("translation"),
-            "rotation": el.attrib.get("rotation"),
-            "scale": el.attrib.get("scale"),
-        }
-    return out
 
 
 def _rotate_x_180(triplet_str: str) -> str:
@@ -138,9 +163,30 @@ def remap(
     orig_scene = orig_tree.getroot().find("Scene")
     if orig_scene is None:
         raise SystemExit(f"{original_path} has no <Scene> block")
-    name_to_orig_id = _build_name_to_id(orig_scene)
-    name_to_orig_transform = (
-        _build_name_to_transform(orig_scene) if restore_transforms else {}
+
+    # Build element lookups from the original. Names key bones/joints (unique,
+    # preserved across the round-trip); shapeIds key Shape meshes (stable even
+    # when Blender mangles duplicate object names).
+    orig_els = list(_walk_scene(orig_scene))
+    name_to_orig_el: dict[str, ET.Element] = {}
+    for el in orig_els:
+        nm = el.attrib.get("name")
+        if nm and nm not in name_to_orig_el:
+            name_to_orig_el[nm] = el
+    shapeid_to_orig_el: dict[int, ET.Element] = {}
+    for el in orig_els:
+        if el.tag != "Shape":
+            continue
+        sid = el.attrib.get("shapeId")
+        if not sid:
+            continue
+        try:
+            shapeid_to_orig_el[int(sid)] = el
+        except ValueError:
+            continue
+    max_orig_id = max(
+        (i for i in (_orig_node_id(el) for el in orig_els) if i is not None),
+        default=0,
     )
 
     exp_tree = ET.parse(exported_path)
@@ -151,11 +197,23 @@ def remap(
 
     # Collect all scene elements with their CURRENT (export) nodeIds in one
     # pass — important to avoid re-walking after we mutate, which would
-    # apply the remap twice on already-rewritten ids.
-    next_fresh_id = _max_id(name_to_orig_id) + 1
+    # apply the remap twice on already-rewritten ids. We also stash each
+    # element's matched original counterpart for the transform-restore pass.
+    next_fresh_id = max_orig_id + 1
     id_remap: dict[int, int] = {}
     unmapped_names: list[str] = []
-    elements_to_rewrite: list[tuple[ET.Element, int]] = []
+    elements_to_rewrite: list[tuple[ET.Element, int, ET.Element | None]] = []
+    used_new_ids: set[int] = set()
+    collided_names: list[str] = []
+
+    def _fresh_id() -> int:
+        nonlocal next_fresh_id
+        while next_fresh_id in used_new_ids:
+            next_fresh_id += 1
+        nid = next_fresh_id
+        next_fresh_id += 1
+        return nid
+
     for el in _walk_scene(exp_scene):
         nm = el.attrib.get("name")
         nid = el.attrib.get("nodeId")
@@ -165,26 +223,70 @@ def remap(
             old_id = int(nid)
         except ValueError:
             continue
-        # Match against the original by stripping Blender's auto-rename
-        # suffix (.001, .002, ...) — happens when the user re-imports
-        # without clearing the scene.
-        lookup_name = nm if nm in name_to_orig_id else _strip_dup_suffix(nm)
-        if lookup_name in name_to_orig_id:
-            id_remap[old_id] = name_to_orig_id[lookup_name]
-            # Optionally rename the export node back to the canonical name
-            # so the rest of the pipeline matches by name (transforms,
-            # warnings, etc.).
-            if lookup_name != nm:
-                el.set("name", lookup_name)
+        orig_el = _match_orig_el(el, name_to_orig_el, shapeid_to_orig_el)
+        orig_id = _orig_node_id(orig_el) if orig_el is not None else None
+        if orig_id is not None and orig_id not in used_new_ids:
+            id_remap[old_id] = orig_id
+            used_new_ids.add(orig_id)
+            # Rename the export node back to the original's canonical name so
+            # LOD/duplicate suffixes (body.001) don't leak into the .i3d.
+            canon = orig_el.attrib.get("name")
+            if canon and canon != nm:
+                el.set("name", canon)
         else:
-            id_remap[old_id] = next_fresh_id
-            unmapped_names.append(nm)
-            next_fresh_id += 1
-        elements_to_rewrite.append((el, old_id))
+            # No match, OR the matched original id was already claimed by an
+            # earlier node — happens when the export carries meshes the
+            # reference lacks (e.g. horns) so shapeIds/names collide. Never
+            # emit a duplicate nodeId: assign a fresh one and don't restore a
+            # transform from a mismatched original.
+            if orig_id is not None:
+                collided_names.append(nm)
+                orig_el = None
+            else:
+                unmapped_names.append(nm)
+            id_remap[old_id] = _fresh_id()
+        elements_to_rewrite.append((el, old_id, orig_el))
+
+    # Identify the skeleton subtree — the only nodes whose transforms get
+    # restored. Meshes skin to their bones via `skinBindNodeIds`, so those
+    # referenced ids are the animation joints; any node whose subtree contains
+    # a joint is part of the skeleton (the joints + their container). The mesh
+    # hierarchy (LOD groups, Shapes, horns, cowProxy) contains no such node and
+    # is left exactly as the exporter oriented it.
+    skin_target_ids: set[int] = set()
+    for el in _walk_scene(exp_scene):
+        attr = el.attrib.get("skinBindNodeIds")
+        if not attr:
+            continue
+        for tok in attr.split():
+            try:
+                skin_target_ids.add(int(tok))
+            except ValueError:
+                continue
+
+    skeletal_old_ids: set[int] = set()
+
+    def _mark_skeletal(el) -> bool:
+        nid = el.attrib.get("nodeId")
+        try:
+            my_id = int(nid) if nid is not None else None
+        except ValueError:
+            my_id = None
+        contains = my_id is not None and my_id in skin_target_ids
+        for child in el:
+            if child.tag in _NODE_KINDS and _mark_skeletal(child):
+                contains = True
+        if contains and my_id is not None:
+            skeletal_old_ids.add(my_id)
+        return contains
+
+    for el in exp_scene:
+        if el.tag in _NODE_KINDS:
+            _mark_skeletal(el)
 
     # Rewrite each element's nodeId exactly once using the captured old id.
     rewrite_count = 0
-    for el, old_id in elements_to_rewrite:
+    for el, old_id, _orig in elements_to_rewrite:
         new_id = id_remap.get(old_id, old_id)
         if new_id != old_id:
             el.set("nodeId", str(new_id))
@@ -209,21 +311,25 @@ def remap(
             el.set("skinBindNodeIds", new_str)
             skin_rewrite += 1
 
-    # Restore original translation/rotation/scale on every node that exists
-    # in both files. This undoes any axis-conversion or bone-decomposition
-    # drift introduced by the import → Blender → export round-trip, which
-    # is essential for .i3d.anim keyframes (authored against the original
-    # rest pose) to play correctly.
+    # Restore original translation/rotation/scale from each node's matched
+    # original counterpart. This undoes axis-conversion / bone-decomposition
+    # drift so .i3d.anim keyframes (authored against the original rest pose)
+    # play correctly.
+    #
+    # Restricted to the SKELETON subtree (joints + their container). The entire
+    # mesh hierarchy — LOD/mesh groups, Shapes, horns, cowProxy — is left with
+    # the orientation the exporter wrote. Restoring a mesh group (e.g. the
+    # `cattleHolstein` group's +90 X axis residue) would rotate everything
+    # under it; restoring a Shape from a mismatched reference would tip a LOD
+    # body. Only the animation joints need their original rest transforms.
     transform_restored = 0
     if restore_transforms:
-        for el in _walk_scene(exp_scene):
-            nm = el.attrib.get("name")
-            if not nm or nm not in name_to_orig_transform:
+        for el, old_id, orig_el in elements_to_rewrite:
+            if orig_el is None or old_id not in skeletal_old_ids:
                 continue
-            orig_t = name_to_orig_transform[nm]
             changed = False
             for attr in ("translation", "rotation", "scale"):
-                want = orig_t[attr]
+                want = orig_el.attrib.get(attr)
                 cur = el.attrib.get(attr)
                 if want is None:
                     # Original didn't have this attribute — drop it from export.
@@ -268,14 +374,25 @@ def remap(
             print(f"    ... +{len(unmapped_names) - 20} more")
         print("  These got fresh nodeIds at the end of the range. If any of")
         print("  them are skin/animation targets, the .anim file won't find them.")
+    if collided_names:
+        print(f"  WARNING: {len(collided_names)} node(s) collided with an already-used id and")
+        print("  got FRESH ids instead (kept the file valid). This means the export")
+        print("  contains meshes the reference .i3d does not (e.g. extra LOD/horn")
+        print("  shapes), so their shapeIds/names don't line up. The skeleton and")
+        print("  animation are unaffected, but for clean mesh names/ids the")
+        print("  reference must be the exact model you imported. Nodes:")
+        for nm in collided_names[:20]:
+            print(f"    {nm!r}")
+        if len(collided_names) > 20:
+            print(f"    ... +{len(collided_names) - 20} more")
     # Also report missing nodes (in original, not in export) — the .anim
     # file is most likely to complain about these.
     exp_names = {el.attrib.get("name") for el in _walk_scene(exp_scene)}
-    missing = [n for n in name_to_orig_id if n not in exp_names]
+    missing = [n for n in name_to_orig_el if n not in exp_names]
     if missing:
         print(f"  WARNING: {len(missing)} node(s) in original are MISSING from export:")
         for nm in missing[:20]:
-            print(f"    {nm!r} (original nodeId={name_to_orig_id[nm]})")
+            print(f"    {nm!r} (original nodeId={_orig_node_id(name_to_orig_el[nm])})")
         if len(missing) > 20:
             print(f"    ... +{len(missing) - 20} more")
         print("  GIANTS Editor will warn 'Transform group id N not found' for any")
@@ -284,10 +401,40 @@ def remap(
 
 
 def main():
-    if len(sys.argv) != 4:
-        print(__doc__)
-        sys.exit(1)
-    remap(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Remap exported .i3d nodeIds back to the original's numbering.",
+    )
+    ap.add_argument("original", type=Path, help="the original imported .i3d")
+    ap.add_argument("exported", type=Path, help="the freshly exported .i3d")
+    ap.add_argument("output", type=Path, help="destination path for the fixed .i3d")
+    ap.add_argument(
+        "--vertex-rotate",
+        choices=("none", "x180"),
+        default="none",
+        help=(
+            "Rotation applied to inline mesh vertices/normals. "
+            "'none' (default) suits a native GIANTS export (Forward -Z, Up Y) "
+            "whose vertices are already in the Y-up bone frame. Use 'x180' only "
+            "if your export axis setting leaves the mesh flipped relative to the "
+            "skeleton."
+        ),
+    )
+    ap.add_argument(
+        "--no-restore-transforms",
+        action="store_true",
+        help="Do not copy the original node translation/rotation/scale onto the export.",
+    )
+    args = ap.parse_args()
+
+    remap(
+        args.original,
+        args.exported,
+        args.output,
+        restore_transforms=not args.no_restore_transforms,
+        rotate_vertices=(args.vertex_rotate == "x180"),
+    )
 
 
 if __name__ == "__main__":

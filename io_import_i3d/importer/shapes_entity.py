@@ -127,21 +127,31 @@ class ShapeData:
 
 def parse_shape_entity(data: bytes, file_version: int) -> ShapeData:
     r = _R(data)
+    name = "<unparsed>"
 
-    # I3DPart header
-    name_len = r.i32()
-    if name_len < 0 or name_len > 4096:
-        raise ValueError(f"unreasonable shape name length {name_len}")
-    name = r.read(name_len).decode("ascii", errors="replace")
-    r.align(4)
-    shape_id = r.u32()
+    def _err(section: str) -> str:
+        return (f"{section} for shape {name!r} (entity size {len(data)}, "
+                f"file pos {r.tell()})")
 
-    # I3DShape.ReadContents
-    bounding = r.vec4()
-    corner_count = r.u32()
-    num_subsets = r.u32()
-    vertex_count = r.u32()
-    options = r.u32()
+    try:
+        # I3DPart header
+        name_len = r.i32()
+        if name_len < 0 or name_len > 4096:
+            raise ValueError(f"unreasonable shape name length {name_len}")
+        name = r.read(name_len).decode("ascii", errors="replace")
+        r.align(4)
+        shape_id = r.u32()
+
+        # I3DShape.ReadContents
+        bounding = r.vec4()
+        corner_count = r.u32()
+        num_subsets = r.u32()
+        vertex_count = r.u32()
+        options = r.u32()
+    except EOFError as e:
+        raise ValueError(f"EOF in header: {e}") from e
+    print(f"[i3d-shape] entity name={name!r} id={shape_id} verts={vertex_count} "
+          f"corners={corner_count} subsets={num_subsets} options={options:#x}")
 
     has_normals = bool(options & OPT_HAS_NORMALS)
     has_uv = [bool(options & (OPT_HAS_UV1 << i)) for i in range(4)]
@@ -181,82 +191,107 @@ def parse_shape_entity(data: bytes, file_version: int) -> ShapeData:
     if file_version >= 9:
         vtx_compression = r.f32()
 
-    is_int_idx = vertex_count > 0x10000  # > 65536 → 32-bit indices
-    tri_count = corner_count // 3
-    triangles: list[tuple[int, int, int]] = []
-    if is_int_idx:
-        for _ in range(tri_count):
-            triangles.append(struct.unpack("<III", r.read(12)))
-    else:
-        for _ in range(tri_count):
-            triangles.append(struct.unpack("<HHH", r.read(6)))
+    try:
+        is_int_idx = vertex_count > 0x10000
+        tri_count = corner_count // 3
+        triangles: list[tuple[int, int, int]] = []
+        if is_int_idx:
+            for _ in range(tri_count):
+                triangles.append(struct.unpack("<III", r.read(12)))
+        else:
+            for _ in range(tri_count):
+                triangles.append(struct.unpack("<HHH", r.read(6)))
+        r.align(4)
+    except EOFError as e:
+        raise ValueError(f"EOF in triangles: {_err('triangles')}: {e}") from e
 
-    r.align(4)
-
-    positions = [r.vec3() for _ in range(vertex_count)]
+    try:
+        positions = [r.vec3() for _ in range(vertex_count)]
+    except EOFError as e:
+        raise ValueError(f"EOF in positions: {_err('positions')}: {e}") from e
 
     normals: list[tuple[float, float, float]] | None = None
     if has_normals:
-        normals = [r.vec3() for _ in range(vertex_count)]
+        try:
+            normals = [r.vec3() for _ in range(vertex_count)]
+        except EOFError as e:
+            raise ValueError(f"EOF in normals: {_err('normals')}: {e}") from e
 
     tangents: list[tuple[float, float, float, float]] | None = None
     if has_tangents and file_version >= 5:
-        tangents = [r.vec4() for _ in range(vertex_count)]
+        try:
+            tangents = [r.vec4() for _ in range(vertex_count)]
+        except EOFError as e:
+            raise ValueError(f"EOF in tangents: {_err('tangents')}: {e}") from e
 
     uv_sets: list[list[tuple[float, float]] | None] = [None, None, None, None]
     for i in range(4):
         if not has_uv[i]:
             continue
         uvs: list[tuple[float, float]] = []
-        if 4 <= file_version <= 5:
-            # Donkie reads V, U for these versions
-            for _ in range(vertex_count):
-                v = r.f32()
-                u = r.f32()
-                uvs.append((u, v))
-        else:
-            for _ in range(vertex_count):
-                u = r.f32()
-                v = r.f32()
-                uvs.append((u, v))
+        try:
+            if 4 <= file_version <= 5:
+                for _ in range(vertex_count):
+                    v = r.f32(); u = r.f32()
+                    uvs.append((u, v))
+            else:
+                for _ in range(vertex_count):
+                    u = r.f32(); v = r.f32()
+                    uvs.append((u, v))
+        except EOFError as e:
+            raise ValueError(f"EOF in UV{i+1}: {_err(f'UV{i+1}')}: {e}") from e
         uv_sets[i] = uvs
 
     vertex_colors: list[tuple[float, float, float, float]] | None = None
     if has_color:
-        vertex_colors = [r.vec4() for _ in range(vertex_count)]
+        try:
+            vertex_colors = [r.vec4() for _ in range(vertex_count)]
+        except EOFError as e:
+            raise ValueError(f"EOF in colors: {_err('colors')}: {e}") from e
 
     blend_weights: list[tuple[float, float, float, float]] | None = None
     blend_indices: list[tuple[int, ...]] | None = None
     if has_skin:
-        if not single_blend:
-            blend_weights = [
-                struct.unpack("<ffff", r.read(16)) for _ in range(vertex_count)
-            ]
-            num_idx = 4
-        else:
-            num_idx = 1
-        blend_indices = [tuple(r.read(num_idx)) for _ in range(vertex_count)]
+        try:
+            if not single_blend:
+                blend_weights = [
+                    struct.unpack("<ffff", r.read(16)) for _ in range(vertex_count)
+                ]
+                num_idx = 4
+            else:
+                num_idx = 1
+            blend_indices = [tuple(r.read(num_idx)) for _ in range(vertex_count)]
+        except EOFError as e:
+            raise ValueError(f"EOF in skinning: {_err('skinning')}: {e}") from e
 
     generic_data: list[float] | None = None
     if has_generic:
-        generic_data = [r.f32() for _ in range(vertex_count)]
+        try:
+            generic_data = [r.f32() for _ in range(vertex_count)]
+        except EOFError as e:
+            raise ValueError(f"EOF in generic: {_err('generic')}: {e}") from e
 
-    # No v9 trailer here — the bytes we previously skipped were actually
-    # the extra u32 at each subset's start + the post-subset 4-byte field.
-
-    num_attachments = r.u32()
-    attachments_raw: list[bytes] = []
-    for _ in range(num_attachments):
-        flags = r.u32()
-        floats_bytes = b""
-        if flags & 4:
-            floats_bytes = r.read(12)
-        n = r.i32()
-        a_data = r.read(max(0, n))
-        # Stash the whole thing including its prefix for round-trip later
-        attachments_raw.append(
-            struct.pack("<I", flags) + floats_bytes + struct.pack("<i", n) + a_data
-        )
+    try:
+        num_attachments = r.u32()
+        attachments_raw: list[bytes] = []
+        for _ in range(num_attachments):
+            flags = r.u32()
+            floats_bytes = b""
+            if flags & 4:
+                floats_bytes = r.read(12)
+            n = r.i32()
+            a_data = r.read(max(0, n))
+            attachments_raw.append(
+                struct.pack("<I", flags) + floats_bytes + struct.pack("<i", n) + a_data
+            )
+    except EOFError as e:
+        # Many shapes simply have no attachment section at all — skip
+        # silently if the file ended cleanly after vertex data.
+        if r.remaining() == 0:
+            num_attachments = 0
+            attachments_raw = []
+        else:
+            raise ValueError(f"EOF in attachments: {_err('attachments')}: {e}") from e
 
     return ShapeData(
         name=name,

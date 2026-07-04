@@ -15,18 +15,48 @@ class I3D_OT_import_i3d(bpy.types.Operator, ImportHelper):
     filter_glob: StringProperty(default="*.i3d", options={'HIDDEN'})
 
     import_animations: BoolProperty(
-        name="Import animations (experimental)",
+        name="Import animations",
         description=(
-            "Parse the sibling .i3d.anim file and create Actions on the armature. "
-            "The track structure is decoded but the rotation encoding for the "
-            "per-keyframe values is not yet fully reverse-engineered, so motion "
-            "may look wrong. Off by default until cracked"
+            "Parse the .i3d.anim clips and create Actions on the armature. Point "
+            "'Animation i3d' at the animations file (e.g. cattleCalfAnimations.i3d) "
+            "and enable 'Exact bone orientation' for correct playback"
+        ),
+        default=False,
+    )
+    animation_i3d_path: StringProperty(
+        name="Animation i3d",
+        description=(
+            "The separate skeleton-only animation file (e.g. cattleCalfAnimations.i3d) "
+            "whose sibling .i3d.anim holds the clips. It provides the bone id->name "
+            "table the tracks reference. Leave blank to use a .anim referenced by the "
+            "imported model itself"
+        ),
+        subtype='FILE_PATH',
+        default="",
+    )
+    exact_bone_orientation: BoolProperty(
+        name="Exact bone orientation",
+        description=(
+            "Build bones in each joint's exact rest orientation (they point sideways) "
+            "instead of down the chain. No longer required for animation — the importer "
+            "now deforms via forward kinematics, so normal point-at-child bones animate "
+            "correctly. Leave OFF unless you specifically want the raw joint frames"
         ),
         default=False,
     )
     import_materials: BoolProperty(
         name="Import materials",
         description="Create Principled BSDF materials and link textures (where resolvable)",
+        default=True,
+    )
+    import_attributes: BoolProperty(
+        name="Import i3d attributes",
+        description=(
+            "Copy each node's GIANTS attributes (collision, density, shadows, LOD, "
+            "masks, …) into StjerneIdioten i3dio's I3D panels in Object/Data "
+            "Properties, so they show up and round-trip on re-export. No effect if "
+            "the i3dio exporter isn't installed"
+        ),
         default=True,
     )
     bone_display_size: FloatProperty(
@@ -55,6 +85,16 @@ class I3D_OT_import_i3d(bpy.types.Operator, ImportHelper):
         ],
         default='-Y',
     )
+    order_prefix: BoolProperty(
+        name="Preserve order (01_ prefix)",
+        description=(
+            "Rename imported objects with a zero-padded order prefix (01_, 02_, …) "
+            "per parent, so Blender's alphabetical outliner keeps the original i3d "
+            "scene order instead of scrambling it. Bones aren't renamed, and the "
+            "round-trip tools strip the prefix, so export is unaffected"
+        ),
+        default=True,
+    )
     wrap_in_container: BoolProperty(
         name="Wrap in container empty",
         description=(
@@ -73,13 +113,21 @@ class I3D_OT_import_i3d(bpy.types.Operator, ImportHelper):
 
         col = layout.column(heading="Import")
         col.prop(self, "import_materials")
+        col.prop(self, "import_attributes")
         col.prop(self, "import_animations")
+
+        col = layout.column(heading="Animation")
+        sub = col.column()
+        sub.enabled = self.import_animations
+        sub.prop(self, "animation_i3d_path")
+        sub.prop(self, "exact_bone_orientation")
 
         col = layout.column(heading="Orientation")
         col.prop(self, "axis_convention")
         col.prop(self, "forward_axis")
 
         col = layout.column(heading="Hierarchy")
+        col.prop(self, "order_prefix")
         col.prop(self, "wrap_in_container")
 
         col = layout.column(heading="Armature")
@@ -92,7 +140,11 @@ class I3D_OT_import_i3d(bpy.types.Operator, ImportHelper):
                 filepath=self.filepath,
                 options={
                     'import_animations': self.import_animations,
+                    'animation_i3d_path': self.animation_i3d_path,
+                    'exact_bone_orientation': self.exact_bone_orientation,
                     'import_materials': self.import_materials,
+                    'import_attributes': self.import_attributes,
+                    'order_prefix': self.order_prefix,
                     'bone_display_size': self.bone_display_size,
                     'axis_convention': self.axis_convention,
                     'forward_axis': self.forward_axis,

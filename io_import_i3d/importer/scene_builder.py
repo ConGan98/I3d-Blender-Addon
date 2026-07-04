@@ -7,6 +7,7 @@ A top-level Empty holds the Y-up→Z-up axis conversion; all i3d roots parent to
 """
 from __future__ import annotations
 
+import re
 from typing import Iterable
 
 import bpy
@@ -14,6 +15,46 @@ from mathutils import Matrix, Euler
 
 from . import axis_convert
 from . import xml_parser as xp
+
+_ORDER_PREFIX_RE = re.compile(r"^\d+_")
+
+
+def apply_order_prefixes(doc: xp.I3DDocument, nodes_by_id: dict) -> int:
+    """Rename each imported OBJECT with a zero-padded order prefix (01_, 02_, …)
+    matching its sibling order in the i3d scene graph, so Blender's alphabetical
+    outliner shows objects in the original i3d order instead of scrambled.
+
+    Per-parent numbering (siblings restart at 01). Covers empties, meshes, and
+    the armature object; bones are NOT renamed (they keep their i3d names, which
+    skinning and the .i3d.anim match by). Any existing NN_ prefix is stripped
+    first, so re-importing an already-prefixed file re-numbers cleanly. The
+    round-trip tools strip NN_ when matching, so export/graft is unaffected.
+    Returns the number of objects renamed.
+    """
+    renamed = 0
+    handled: set[int] = set()  # id() of objects already renamed (armature is shared)
+
+    def _base(name: str) -> str:
+        return _ORDER_PREFIX_RE.sub("", name) if name else name
+
+    def _walk(siblings) -> None:
+        nonlocal renamed
+        count = len(siblings)
+        width = max(2, len(str(count)))
+        for i, node in enumerate(siblings):
+            obj = nodes_by_id.get(node.node_id)
+            if obj is not None and id(obj) not in handled:
+                handled.add(id(obj))
+                base = _base(node.name) or node.name or f"node_{node.node_id}"
+                try:
+                    obj.name = f"{i + 1:0{width}d}_{base}"
+                    renamed += 1
+                except Exception:
+                    pass
+            _walk(node.children)
+
+    _walk(doc.scene_roots)
+    return renamed
 
 
 def build_empties(

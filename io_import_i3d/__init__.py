@@ -1,10 +1,10 @@
 bl_info = {
     "name": "GIANTS i3d Importer",
     "author": "Conor Gannon",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (4, 5, 0),
     "location": "File > Import > GIANTS i3d (.i3d)",
-    "description": "Import GIANTS Engine .i3d scenes (Farming Simulator) including .i3d.shapes meshes and .i3d.anim animations",
+    "description": "Import GIANTS Engine .i3d scenes (Farming Simulator): .i3d.shapes meshes, armature + skinning, materials, i3d attributes, and round-trip tools. Animation import is experimental.",
     "category": "Import-Export",
     "doc_url": "",
     "tracker_url": "",
@@ -12,12 +12,13 @@ bl_info = {
 
 import bpy
 
-from . import preferences, operator
+from . import preferences, operator, mesh_tools
 
 
 _classes = (
     preferences.I3DImporterPreferences,
     operator.I3D_OT_import_i3d,
+    *mesh_tools.classes,
 )
 
 

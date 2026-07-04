@@ -16,7 +16,7 @@ from typing import Optional
 def _parse_vec3(s: Optional[str], default=(0.0, 0.0, 0.0)) -> tuple[float, float, float]:
     if not s:
         return default
-    parts = s.split()
+    parts = s.replace(",", " ").split()
     if len(parts) != 3:
         return default
     return (float(parts[0]), float(parts[1]), float(parts[2]))
@@ -25,7 +25,9 @@ def _parse_vec3(s: Optional[str], default=(0.0, 0.0, 0.0)) -> tuple[float, float
 def _parse_int_list(s: Optional[str]) -> list[int]:
     if not s:
         return []
-    return [int(p) for p in s.split() if p]
+    # i3d attributes use either spaces ("1 2 6") or commas ("7,8") as
+    # separators, sometimes both ("1, 2, 6"). Normalise to whitespace first.
+    return [int(p) for p in s.replace(",", " ").split() if p]
 
 
 def _parse_bool(s: Optional[str], default: bool = False) -> bool:
@@ -78,6 +80,9 @@ class SceneNode:
 
     # Misc:
     extras: dict[str, str] = field(default_factory=dict)
+    # Every XML attribute on the node, verbatim (incl. the ones parsed into the
+    # typed fields above). Used to populate i3dio's i3d_attributes on import.
+    raw_attribs: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -262,6 +267,7 @@ def _parse_scene_node(el: ET.Element) -> SceneNode | None:
         "receiveShadows", "nonRenderable", "clipDistance",
     }
     node.extras = {k: v for k, v in a.items() if k not in handled}
+    node.raw_attribs = dict(a)
 
     for child in el:
         sub = _parse_scene_node(child)

@@ -34,10 +34,17 @@ def build_materials(
     *,
     data_path: str = "",
     data_s_path: str = "",
+    apply_i3d_shader: bool = False,
     log=None,
 ):
     """Create one bpy.types.Material per i3d <Material> and assign to all
-    Shape meshes that reference it. Returns count of materials created."""
+    Shape meshes that reference it. Returns count of materials created.
+
+    When `apply_i3d_shader` is set and StjerneIdioten i3dio is installed, also
+    populates i3dio's `material.i3d_attributes` shader (name/variation/params/
+    textures) so the custom GIANTS shader shows in the Material panel and
+    round-trips on export.
+    """
     import bpy
 
     if not doc.materials:
@@ -119,6 +126,13 @@ def build_materials(
         if md.custom_maps:
             mat["_i3d_custom_maps"] = {k: int(v) for k, v in md.custom_maps.items()}
 
+        if apply_i3d_shader:
+            status = _apply_i3dio_shader(
+                mat, md, doc, base_dir, data_path, data_s_path, log,
+            )
+            if status and log:
+                log.info("material '%s': %s", md.name, status)
+
         mats_by_id[mid] = mat
 
     # Assign materials to Shape meshes by materialIds.
@@ -136,6 +150,90 @@ def build_materials(
                 obj.data.materials.append(mat)
 
     return len(mats_by_id)
+
+
+def _apply_i3dio_shader(mat, md, doc, base_dir, data_path, data_s_path, log):
+    """Populate StjerneIdioten i3dio's `material.i3d_attributes` from the source
+    material's custom shader (id -> shader file, variation, parameters, custom
+    maps). Returns a one-line status for logging, or None if nothing to do /
+    i3dio absent. Best-effort: i3dio must be able to FIND the shader (its FS /
+    shader path must be configured) for parameters and textures to populate.
+    """
+    attrs = getattr(mat, "i3d_attributes", None)
+    if attrs is None or not hasattr(attrs, "shader_name"):
+        return None  # i3dio not installed
+    if md.custom_shader_id is None:
+        return None  # plain game material — nothing custom to set
+
+    fref = doc.files.get(md.custom_shader_id)
+    if fref is None or not fref.filename:
+        return None
+    raw = fref.filename.replace("\\", "/")
+    stem = Path(raw).stem                       # tileAndMirrorShader.xml -> tileAndMirrorShader
+    is_game = raw.startswith("$data")           # $data / $dataS => game shader
+
+    # Setting shader_name triggers i3dio's ShaderManager to load the shader,
+    # which populates variations + base params/textures. It only succeeds if
+    # i3dio can locate the shader file.
+    try:
+        if hasattr(attrs, "use_custom_shaders"):
+            attrs.use_custom_shaders = not is_game
+        attrs.shader_name = stem
+    except Exception as e:
+        return f"could not set shader '{stem}' ({e})"
+
+    if getattr(attrs, "shader_name", "") != stem:
+        return (f"shader '{stem}' not found by i3dio — set its shader/FS path in "
+                f"i3dio preferences, then re-import for parameters")
+
+    if md.custom_shader_variation:
+        try:
+            attrs.shader_variation_name = md.custom_shader_variation
+        except Exception:
+            pass
+
+    # Parameters: dynamic ID-properties on shader_material_params (only set the
+    # ones the loaded shader actually defines).
+    set_p = 0
+    params = getattr(attrs, "shader_material_params", None)
+    if params is not None:
+        try:
+            existing = set(params.keys())
+        except Exception:
+            existing = set()
+        for pname, pval in md.custom_parameters.items():
+            if pname not in existing:
+                continue
+            vals = [float(x) for x in pval.replace(",", " ").split() if x]
+            if not vals:
+                continue
+            try:
+                params[pname] = vals[0] if len(vals) == 1 else vals
+                set_p += 1
+            except Exception:
+                pass
+
+    # Custom maps -> shader texture sources (matched by name).
+    set_t = 0
+    texcol = getattr(attrs, "shader_material_textures", None)
+    if texcol is not None and md.custom_maps:
+        for map_name, fid in md.custom_maps.items():
+            tex = next((t for t in texcol if t.name == map_name), None)
+            if tex is None:
+                continue
+            fr = doc.files.get(fid)
+            if fr is None or not fr.filename:
+                continue
+            resolved = _resolve_path(fr.filename, base_dir, data_path, data_s_path)
+            if resolved is not None:
+                try:
+                    tex.source = str(resolved)
+                    set_t += 1
+                except Exception:
+                    pass
+
+    return (f"shader={stem} variation={md.custom_shader_variation or '-'} "
+            f"params={set_p}/{len(md.custom_parameters)} textures={set_t}")
 
 
 def _load_image_for_file_id(doc, fid, base_dir, data_path, data_s_path, log):

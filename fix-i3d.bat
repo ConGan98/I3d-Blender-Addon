@@ -13,6 +13,14 @@ REM  Or run from a console:
 REM    fix-i3d.bat <exported.i3d> [original.i3d] [output.i3d]
 REM ====================================================================
 
+REM --- Mesh orientation ------------------------------------------------
+REM  none : native GIANTS export (I3D exporter Forward -Z, Up Y). The mesh
+REM         is already in the Y-up bone frame, so no rotation is applied.
+REM  x180 : legacy -- only if your export axis setting leaves the mesh
+REM         upside down / facing backward relative to the skeleton.
+set "VERTEX_ROTATE=none"
+REM --------------------------------------------------------------------
+
 if "%~1"=="" (
     echo Drag the exported .i3d file onto this script.
     echo Or run: fix-i3d.bat ^<exported.i3d^> [original.i3d] [output.i3d]
@@ -57,7 +65,7 @@ echo Exported : %EXPORTED%
 echo Output   : %OUTPUT%
 echo.
 
-python "%SCRIPT%" "%ORIGINAL%" "%EXPORTED%" "%OUTPUT%"
+python "%SCRIPT%" "%ORIGINAL%" "%EXPORTED%" "%OUTPUT%" --vertex-rotate %VERTEX_ROTATE%
 set RC=%errorlevel%
 
 echo.

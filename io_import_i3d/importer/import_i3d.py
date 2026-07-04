@@ -17,6 +17,7 @@ from . import shapes_reader
 from . import armature_builder
 from . import skin_binder
 from . import material_builder
+from . import attribute_builder
 from . import anim_reader
 from . import anim_apply
 from . import log as _log
@@ -81,11 +82,13 @@ def run(*, context: bpy.types.Context, filepath: str, options: dict[str, Any]) -
 
     # M4: armature builder — replace bone empties with one Armature object.
     bone_size = float(options.get('bone_display_size', 0.05))
+    exact_bones = bool(options.get('exact_bone_orientation', False))
     arm_obj = None
     node_id_to_bone: dict = {}
     try:
         arm_obj, node_id_to_bone = armature_builder.build_armature(
             doc, nodes_by_id, bone_display_size=bone_size,
+            exact_bone_orientation=exact_bones,
         )
         if arm_obj is not None:
             log.info("Built armature '%s' with %d bones", arm_obj.name, len(node_id_to_bone))
@@ -113,20 +116,73 @@ def run(*, context: bpy.types.Context, filepath: str, options: dict[str, Any]) -
             doc, nodes_by_id,
             data_path=getattr(prefs, 'data_path', '') or '',
             data_s_path=getattr(prefs, 'data_s_path', '') or '',
+            apply_i3d_shader=options.get('import_attributes', True),
             log=log,
         )
         log.info("Created %d materials", n_mats)
 
+    # i3d node attributes -> i3dio's i3d_attributes (Object + Data panels), so
+    # physics/collision/render flags show up in the standard panels and
+    # round-trip on re-export. No-op if i3dio isn't installed.
+    if options.get('import_attributes', True):
+        try:
+            attr_stats = attribute_builder.apply_node_attributes(doc, nodes_by_id, log=log)
+        except Exception as e:
+            log.warning("i3d attribute import failed (%s); geometry/rig unaffected", e)
+
     # M7/M8: animation import — parse .i3d.anim and create Blender Actions.
     anim_stats = {"actions_built": 0, "fcurves_written": 0}
-    if (
-        options.get('import_animations', True)
-        and arm_obj is not None
-        and doc.animation
-        and doc.animation.external_file
-    ):
-        anim_path = path.parent / doc.animation.external_file
-        if anim_path.exists():
+    if options.get('import_animations', True) and arm_obj is not None:
+        anim_id_to_name: dict | None = None
+        anim_path = None
+
+        # Preferred: an explicit ANIMATION i3d (the animation lives in a separate
+        # file, e.g. cattleCalfAnimations.i3d). It supplies both the bone
+        # id->name table the .anim tracks reference (its own numbering, calf
+        # 4..48) AND the .anim it points to.
+        # Strip whitespace and surrounding quotes — Windows "Copy as path" wraps
+        # the path in double quotes, which would make .exists() fail silently.
+        anim_i3d_str = (options.get('animation_i3d_path', '') or '').strip().strip('"').strip("'")
+        if not anim_i3d_str:
+            # Auto-detect: a sibling animation i3d in the model's folder is any
+            # *.i3d that has a matching *.i3d.anim next to it (the model itself
+            # usually has no .anim sibling, so it won't self-match).
+            for cand in sorted(path.parent.glob('*.i3d')):
+                if cand != path and cand.with_name(cand.name + '.anim').exists():
+                    anim_i3d_str = str(cand)
+                    log.info("Auto-detected animation i3d: %s", cand.name)
+                    break
+        if anim_i3d_str:
+            anim_i3d_path = Path(anim_i3d_str)
+            # Tolerate pointing at the .i3d.anim binary instead of the .i3d XML:
+            # derive the sibling .i3d (strip the trailing .anim).
+            if anim_i3d_path.suffix.lower() == ".anim" and anim_i3d_path.name.lower().endswith(".i3d.anim"):
+                derived = anim_i3d_path.with_name(anim_i3d_path.name[:-len(".anim")])
+                if derived.exists():
+                    log.info("Animation i3d: using %s (derived from the .anim you picked)", derived.name)
+                    anim_i3d_path = derived
+            if anim_i3d_path.exists():
+                try:
+                    anim_i3d_doc = xp.parse_i3d(anim_i3d_path)
+                    anim_id_to_name = {
+                        n.node_id: n.name
+                        for n in anim_i3d_doc.all_nodes() if n.name
+                    }
+                    if anim_i3d_doc.animation and anim_i3d_doc.animation.external_file:
+                        anim_path = anim_i3d_path.parent / anim_i3d_doc.animation.external_file
+                    log.info("Animation source: %s (%d named nodes, anim=%s)",
+                             anim_i3d_path.name, len(anim_id_to_name),
+                             anim_path.name if anim_path else "<none>")
+                except Exception as e:
+                    log.warning("Failed to read animation i3d %s (%s)", anim_i3d_path, e)
+            else:
+                log.warning("Animation i3d not found: %s", anim_i3d_path)
+
+        # Fallback: a .anim referenced by the imported model itself.
+        if anim_path is None and doc.animation and doc.animation.external_file:
+            anim_path = path.parent / doc.animation.external_file
+
+        if anim_path is not None and anim_path.exists():
             try:
                 anim_doc = anim_reader.parse_anim(anim_path)
                 log.info(
@@ -136,12 +192,22 @@ def run(*, context: bpy.types.Context, filepath: str, options: dict[str, Any]) -
                 anim_stats = anim_apply.apply_animation(
                     arm_obj, anim_doc,
                     node_id_to_bone=node_id_to_bone,
+                    anim_id_to_name=anim_id_to_name,
                     log=log,
                 )
             except Exception as e:
                 log.warning("Anim import failed (%s); meshes & rig still imported", e)
         else:
-            log.warning("External anim file not found: %s", anim_path)
+            log.warning(
+                "No .anim to import — set 'Animation i3d' to the animations file "
+                "(e.g. cattleCalfAnimations.i3d) whose sibling .anim holds the clips"
+            )
+
+    # Order prefix: rename objects with 01_, 02_, … per sibling group so the
+    # outliner keeps the original i3d order (Blender sorts alphabetically).
+    if options.get('order_prefix', True):
+        n_renamed = scene_builder.apply_order_prefixes(doc, nodes_by_id)
+        log.info("Order prefix: renamed %d object(s) to preserve i3d order", n_renamed)
 
     # Active selection: prefer the wrapping root, otherwise the first scene root.
     for obj in bpy.context.selected_objects:

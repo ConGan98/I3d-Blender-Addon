@@ -111,17 +111,25 @@ def _build_mesh(shape: se.ShapeData, name: str):
     if dropped:
         me["_i3d_dropped_tris"] = dropped
 
-    # UV layer. GIANTS stores UVs already in Blender's bottom-left convention,
-    # so we use them directly (no V flip).
-    if shape.uv_sets[0] is not None:
-        uvs = shape.uv_sets[0]
-        uv_layer = me.uv_layers.new(name="UVMap")
-        if uv_layer is not None:
-            for poly in me.polygons:
-                for li, vi in zip(poly.loop_indices, poly.vertices):
-                    if 0 <= vi < len(uvs):
-                        u, v = uvs[vi]
-                        uv_layer.data[li].uv = (u, v)
+    # UV layers. GIANTS stores UVs already in Blender's bottom-left convention,
+    # so we use them directly (no V flip). A shape may carry up to 4 UV sets:
+    # channel 0 is the texture-atlas UV; fur/alpha meshes additionally use
+    # channel 1 (UV2) for the fur-strip mapping. Create a Blender UV layer for
+    # every set present so none are silently dropped. The first layer created
+    # (channel 0 when present) stays active, preserving prior behaviour.
+    uv_layer_names = ("UVMap", "UVMap2", "UVMap3", "UVMap4")
+    for ch in range(4):
+        uvs = shape.uv_sets[ch]
+        if uvs is None:
+            continue
+        uv_layer = me.uv_layers.new(name=uv_layer_names[ch])
+        if uv_layer is None:
+            continue
+        for poly in me.polygons:
+            for li, vi in zip(poly.loop_indices, poly.vertices):
+                if 0 <= vi < len(uvs):
+                    u, v = uvs[vi]
+                    uv_layer.data[li].uv = (u, v)
 
     # Mark all polygons smooth-shaded; rely on Blender's auto-computed
     # vertex normals. Authored split normals are deferred — Blender 4.5's

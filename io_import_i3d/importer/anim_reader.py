@@ -176,6 +176,11 @@ def parse_anim(path: Path | str) -> AnimDocument:
     if char_count != 1:
         raise ValueError(f"unsupported character_count {char_count}; expected 1")
     char_name, off = _read_string(buf, off)
+    # The character-name string is followed by 4-byte alignment padding before
+    # clip_count. Without this align, clip_count reads as garbage (and the whole
+    # clip loop derails). Verified against cattleCalfAnimations.i3d.anim: aligned
+    # clip_count = 41.
+    off = ((off + 3) // 4) * 4
     clip_count = _u32(buf, off); off += 4
 
     doc = AnimDocument(version=version, character_name=char_name)

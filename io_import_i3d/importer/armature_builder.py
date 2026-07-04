@@ -159,11 +159,17 @@ def build_armature(
     nodes_by_id: dict,
     *,
     bone_display_size: float = 0.05,
+    exact_bone_orientation: bool = False,
 ):
     """Replace the empties for the LCA + its TG descendants with one Armature.
 
     Returns (armature_object, node_id_to_bone_name_map) or (None, {}) if the
     document has no skinned shapes.
+
+    `exact_bone_orientation` builds each bone with the joint's exact rest
+    orientation (bones point along the joint +Y, which looks odd) instead of the
+    default geometric point-at-child bones. Needed for `.i3d.anim` playback,
+    where keyframes are local transforms in the original joint frame.
     """
     import bpy
     import mathutils
@@ -303,6 +309,29 @@ def build_armature(
                 continue
             m = matrices[nid]
             head = m.to_translation()
+
+            if exact_bone_orientation:
+                # Rest frame = the joint's EXACT orientation, so .i3d.anim
+                # keyframes (which are local transforms in that frame) apply
+                # correctly. Bones point along each joint's +Y (they look odd in
+                # the viewport) — fine for an animation-preview rig; NOT used for
+                # the mesh-edit round-trip, where geometric bones are kept.
+                length = bone_display_size
+                _cd = [
+                    (matrices[k].to_translation() - head).length
+                    for k in children_of_bone.get(nid, []) if k in matrices
+                ]
+                _cd = [d for d in _cd if d > 1e-6]
+                if _cd:
+                    length = max(_cd)
+                eb.head = mathutils.Vector((0.0, 0.0, 0.0))
+                eb.tail = mathutils.Vector((0.0, length, 0.0))
+                orient = m.to_quaternion().to_matrix().to_4x4()
+                orient.translation = head
+                eb.matrix = orient
+                bone_name_to_node_id[nm] = nid
+                continue
+
             dir_x = (m.to_3x3() @ mathutils.Vector((1.0, 0.0, 0.0))).normalized()
 
             kids = children_of_bone.get(nid, [])
@@ -402,6 +431,12 @@ def build_armature(
     arm_obj["_i3d_bone_name_to_node_id"] = bone_name_to_node_id
     # And the inverse: nodeId -> bone name (string keys for json-friendly storage)
     arm_obj["_i3d_node_id_to_bone_name"] = {str(k): v for k, v in name_of.items()}
+    # Stash the world transform baked into the bones (axis conversion + parent
+    # chain). anim_apply needs it to re-apply the conversion to the root track,
+    # whose .anim keyframes are in the raw GIANTS frame — otherwise the root
+    # cancels the conversion and the whole model plays tipped 90°. Row-major
+    # 16-float flatten for json-friendly custom-prop storage.
+    arm_obj["_i3d_src_world"] = [v for row in src_world for v in row]
 
     # Preserve each joint's ORIGINAL i3d transform on the bone itself. Blender's
     # head/tail/roll is a lossy proxy for a Maya-style joint matrix (it can't

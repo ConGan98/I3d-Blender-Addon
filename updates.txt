@@ -84,6 +84,91 @@ Change:
   See io_import_i3d/importer/armature_builder.py near build_armature's end.
 
 
+2026-07-02  Animated models now round-trip: graft the skeleton from the anim i3d
+----------------------------------------------------------------------------
+
+Symptom:
+  Re-exporting a skinned FS25 animal and putting it back in GIANTS Editor with
+  its stock animation made the mesh distort / "explode" / flail all over the
+  place the moment the animation played. Adding the missing root node let the
+  clip *run* but it was still broken. Restoring node transforms with the remap
+  tool (remap_node_ids.py --restore-transforms) made it explode even at rest.
+
+Root causes (there were THREE, stacked):
+
+  1. Wrong id space. FS keeps the animation in a SEPARATE skeleton-only i3d
+     (e.g. cattleCalfAnimations.i3d) that ends in <Animation externalAnimFile>.
+     animals.xml marries it to a model via `animation="..."` + skeletonIndex.
+     The .i3d.anim addresses bones by nodeId IN THE ANIMATION FILE's numbering
+     (calf: calf_root=4, spine=5 ... eyeball_R=20), NOT the model's
+     (cattleCalfHolstein: calf_root=20 ...). Feeding fix-i3d.bat the Holstein
+     model remapped bones to Holstein ids, so the anim's "id 20" track
+     (eyeball_R) landed on calf_root, etc. — every bone driven by the wrong
+     channel. Confirmed by decoding the .anim: BoneTrack.bone_node_id values
+     are 4..48 (the animation file's ids).
+
+  2. Wrong rest pose. .i3d.anim keyframes are ABSOLUTE local transforms (they
+     SET each bone every frame, not deltas). GIANTS builds the skin bind from
+     the model's rest pose. A Blender round-trip mangles bone rest ORIENTATIONS
+     (spine_01 exports as 90 -0 180 instead of the original 0 -90 0), so the
+     bind pose disagrees with the frame the anim drives -> distortion.
+
+  3. Why the bind can't be patched afterward. Restoring node transforms in the
+     exported .i3d fixes the rest but desyncs the skin bind (vertices were bound
+     to Blender's frame) -> explodes even at rest. Bind frame and anim frame
+     must agree, and that is decided at import, not export.
+
+Why the Blender round-trip can't preserve the skeleton (the hard tradeoff):
+  Blender always draws a bone along its own frame's +Y, and StjerneIdioten's
+  i3dio exports a bone-to-bone rest as a PURE `parent.matrix_local^-1 @
+  self.matrix_local` (no bone-axis correction — verified in
+  node_classes/skinned_mesh.py). So setting each EditBone's matrix to the exact
+  joint frame WOULD make i3dio re-emit the original rest pose... but then the
+  bones point sideways (along each joint's +Y), not down the chain. You cannot
+  have both "bones follow the path" and "exported rest matches the joint" — no
+  uniform correction C can decouple them (C would have to commute with every
+  transform => C = ±I). We tried exact-orientation bones; the sideways look was
+  rejected and the change reverted. armature_builder.py stays on geometric
+  point-at-child bones.
+
+Fix (the one that works) — graft the skeleton from the ANIMATION i3d:
+  New tool io_import_i3d/tools/graft_skeleton.py + graft-i3d.bat drag-drop.
+  The skeleton still goes through Blender so you can weight the mesh, but we do
+  NOT ship the mangled copy. The graft:
+    - discards the export's Blender skeleton,
+    - drops in the skeleton straight from the animation i3d (correct rest pose
+      AND the exact nodeIds the .anim references), with --preserve-skel-ids,
+    - re-points every mesh's skinBindNodeIds to the grafted bones BY BONE NAME
+      (canonicalised: strips Blender .001 dup-suffix and NN_ order prefix),
+    - renumbers any colliding export mesh ids automatically,
+    - adds <Animation externalAnimFile=...> so GIANTS Editor loads the clip.
+  Result: correct rest + correct ids + your edited mesh => the stock .i3d.anim
+  plays correctly. CONFIRMED WORKING on cattleCalfHolstein (all 16 skinned
+  shapes + animation). This is the canonical path for MESH-ONLY edits and
+  supersedes remap_node_ids.py --restore-transforms for animated models.
+
+  Usage:
+    graft-i3d.bat <exported.i3d>          (picker asks for the animation i3d)
+    python io_import_i3d/tools/graft_skeleton.py <animation.i3d> <export.i3d> \
+        <output.i3d> --preserve-skel-ids --anim-ref <name>.i3d.anim
+
+Gotchas learned:
+  * The graft only keeps what's in the export — ALL mesh parts must be present
+    before grafting. A body-only export (wrong-name export, or not exporting the
+    eyes/teeth/ears/hair objects) yields a body-only result. The calf should
+    have 16 skinBindNodeIds lists; verify before shipping.
+  * The collision proxy comes out of Blender WITHOUT its collision flags
+    (kinematic / density / collisionFilterGroup / nonRenderable). Restore those
+    from the stock proxy before shipping the mod.
+  * .i3d.anim header has a 4-byte ALIGN after the character-name string, before
+    clip_count (calf = 41 clips). anim_reader.parse_anim currently misses this
+    align and mis-reads clip_count — fix when resuming the in-Blender anim work.
+
+  A plain graft (in-game, where binding is structural via skeletonIndex + names
+  and model ids don't matter) is also supported by sourcing the skeleton from
+  the stock model and omitting --preserve-skel-ids.
+
+
 --- Notes for future debugging --------------------------------------------
 
 When troubleshooting bone alignment:
