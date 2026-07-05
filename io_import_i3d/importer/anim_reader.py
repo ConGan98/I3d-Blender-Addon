@@ -145,6 +145,28 @@ def _read_first_track(buf: bytes, off: int, duration_ms: float) -> tuple[BoneTra
     return track, cur
 
 
+def _looks_like_track_header(buf: bytes, off: int) -> bool:
+    """True if the 12 bytes at `off` plausibly begin a std track header
+    ``[u32 bone_node_id][u32 kf_count][u32 reserved=0]`` — as opposed to the
+    next clip's length-prefixed name or garbage.
+
+    SPARSE clips (e.g. the short 2-frame runFwd*) keyframe FEWER bones than the
+    clip header's `bone_count`, so the track list ends early. Without this check
+    the reader keeps going past the last real track and reads into the next
+    clip's name (whose length word looks like a bone id but whose following
+    words don't have reserved==0), desyncing the whole file.
+    """
+    if off + 12 > len(buf):
+        return False
+    if _u32(buf, off + 8) != 0:                 # reserved must be 0
+        return False
+    kf_count = _u32(buf, off + 4)
+    if not (0 < kf_count < 100000):             # sane keyframe count
+        return False
+    bone_node_id = _u32(buf, off)
+    return 0 < bone_node_id < 4096              # sane bone id
+
+
 def _read_track(buf: bytes, off: int) -> tuple[BoneTrack, int]:
     """Tracks 1..N per clip: 12-byte header (bone_node_id, kf_count, reserved)
     + (kf_count-1) std KFs + 28-byte trailer.
@@ -207,7 +229,10 @@ def parse_anim(path: Path | str) -> AnimDocument:
             track, off2 = _read_first_track(buf, body_start, duration_ms)
             clip.bone_tracks.append(track)
             for _ in range(bone_count - 1):
-                if off2 + 12 > len(buf):
+                # Stop at the real end of the track list — sparse clips have
+                # fewer tracks than bone_count; the next bytes are the following
+                # clip's name, not another track.
+                if not _looks_like_track_header(buf, off2):
                     break
                 track, off2 = _read_track(buf, off2)
                 clip.bone_tracks.append(track)

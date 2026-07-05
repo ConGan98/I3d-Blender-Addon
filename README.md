@@ -27,7 +27,7 @@ Without those details I can't reproduce the bug, and the issue will likely just 
 - **Materials** — Principled BSDF with diffuse/normal/gloss textures resolved through `$data` / `$dataS` paths from the addon preferences.
 - **Round-trip for animated models (`graft-i3d.bat`)** — for mesh-only edits, grafts the pristine skeleton from the game's animation `.i3d` onto your re-exported mesh so the original `.i3d.anim` plays correctly in GIANTS Editor. This is the recommended path for anything that has to keep its stock animation.
 - **Node-ID remap (`fix-i3d.bat`)** — simpler helper that only rewrites exporter-assigned node IDs to match an original `.i3d`. Fine for non-animated round-trips; for animated models use `graft-i3d.bat` instead (see below for why).
-- **Animation import into Blender (experimental)** — opt-in. The track structure is decoded but the per-keyframe rotation values aren't fully reverse-engineered yet, so motion played *inside Blender* may look wrong. (Getting a re-exported model to play its stock anim in GIANTS Editor is a separate, solved workflow — see `graft-i3d.bat`.)
+- **Animation import into Blender** — opt-in. The `.i3d.anim` format is fully decoded (each keyframe is translation + Euler-XYZ radians), and clips play correctly *inside Blender* for cattle (calf, Highland, and adult/Angus): all clips import (200+ across the cattle animation files) and the rig deforms the way it does in GIANTS Editor. Other animals (sheep, pig, horse, …) are untested for in-Blender playback but should mostly work — the decode is format-level. (Getting a re-exported model to play its stock anim in GIANTS Editor is a separate workflow — see `graft-i3d.bat`.)
 
 See [updates.txt](updates.txt) for the recent fix log.
 
@@ -48,7 +48,7 @@ Import options:
 
 | Option | Default | Notes |
 |---|---|---|
-| Import animations (experimental) | off | See *Known limitations* below |
+| Import animations | off | Plays correctly for cattle; see *Known limitations* for other animals |
 | Import materials | on | Set `$data`/`$dataS` in addon prefs to resolve textures |
 | Bone display size (m) | 0.05 | Length used for leaf bones with no children |
 | Axis convention | Auto (Y-up → Z-up) | Use **None** to keep raw GIANTS coordinates (debug only) |
@@ -112,8 +112,7 @@ python io_import_i3d/tools/remap_node_ids.py <original.i3d> <exported.i3d> <outp
 
 ## Known limitations
 
-- **Importing animation *into Blender* is experimental.** The track header and bone-mapping are correctly decoded, but the per-keyframe rotation encoding (last 3 of 6 floats per KF) doesn't match any standard rotation parameterisation we tested, so the rig flails when you play it *in Blender*. Off by default. (This is unrelated to `graft-i3d.bat`, which makes a re-exported model play its stock anim correctly *in GIANTS Editor* — that works.)
-- **Only the first clip parses.** Multi-clip animation files (e.g. `cattleCalfAnimations` has 41 clips) currently only read clip 0 cleanly. Note: the `.i3d.anim` header has a 4-byte alignment pad after the character-name string before `clip_count` that `anim_reader.parse_anim` doesn't yet account for — fix this when resuming the in-Blender animation work.
+- **Importing animation *into Blender* is confirmed on cattle only.** The `.i3d.anim` format is fully decoded and playback is correct for calf, Highland, and adult/Angus (all clips import and match GIANTS Editor). Other animals (sheep, pig, horse, water buffalo) haven't been verified in-Blender yet — the decode is format-level so they're likely to work, but the header-less "short_intro" track resolution and the separate-animation-file pairing are the parts most likely to need a per-species tweak. Off by default. (Unrelated to `graft-i3d.bat`, which is the separate stock-anim round-trip into GIANTS Editor.)
 - **Round-trip caveats.** For animated models, use `graft-i3d.bat` (grafts the anim file's skeleton) — the plain `fix-i3d.bat` remap leaves the mangled rest pose and targets the wrong id space. Both tools match bones **by name**, so if you renamed a bone in Blender they can't match it — keep names identical to the original.
 - **Collision proxy loses its flags on export.** i3dio writes the proxy without `kinematic` / `density` / `collisionFilterGroup` / `nonRenderable`; restore them from the stock proxy before shipping a mod.
 - **Lights, cameras, particles, joints** — out of scope. Imported as plain Empties at correct transforms but not converted to Blender equivalents.

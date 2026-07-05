@@ -169,6 +169,81 @@ Gotchas learned:
   the stock model and omitting --preserve-skel-ids.
 
 
+2026-07-05  In-Blender animation now works (cattle): full .i3d.anim decode + apply
+-----------------------------------------------------------------------------
+
+Summary:
+  Animation import INTO Blender — previously experimental/broken — now plays
+  correctly for cattle (calf, highland, and adult/angus). All clips in every
+  cattle animation file import (200+ across the 5 files); the rig deforms the
+  way it does in GIANTS Editor. Turn on "Import animations" and (optionally)
+  point "Animation i3d" at the animations file, or leave it blank to auto-detect.
+
+The .i3d.anim format is fully decoded:
+  * Each keyframe is (translation.xyz, Euler-XYZ-radians). GIANTS' intrinsic
+    ZY'X'' == Blender Euler order 'XYZ' (same convention fix as the 2026-05-13
+    skeleton work).
+  * File header has a 4-byte ALIGN after the character-name string before
+    clip_count — without it clip_count read as garbage and only clip 0 parsed.
+    Fixed: all 41 cattle clips parse.
+  * Track order is ALPHABETICAL by bone name. Track 0 is header-less
+    ("short_intro"); it's the alphabetically-first ANIMATED bone (cow_belly for
+    cattle), resolved by elimination (min of the bones not covered by an
+    explicit-id track). An earlier version sent it to the root, moving the whole
+    rig "off by a node".
+  * Sparse clips (the 2-frame runFwd*) keyframe fewer bones than the clip
+    header's bone_count; anim_reader now stops the track list at its real end
+    via _looks_like_track_header (reserved==0 + sane id/kf_count) instead of
+    reading into the next clip's name and desyncing the file.
+
+Apply is forward-kinematic on the DEFORMATION (see anim_apply.py docstring):
+  D[b] = src_world @ JA[b] @ JR[b]^-1 @ src_world^-1, target[b] = D[b] @ matloc.
+  Rest FK (JR) is rebuilt from each bone's stored _i3d_translation /
+  _i3d_rotation_zyx_deg. Bones are imported with use_connect=False so keyframe
+  TRANSLATION animates (a connected bone locks its head, killing e.g. the
+  tongue's extension). Normal point-at-child bones deform correctly — no
+  "exact orientation" (sideways) bones needed.
+
+Two fixes landed today that made the ADULT/Angus clips correct:
+
+  1. Time-based sampling for sparse per-bone keyframing (the adult fix).
+     Highland/calf clips are UNIFORM — every animated bone shares the same
+     keyframe times (e.g. 35), so sampling all bones by index i lines up. ADULT
+     clips are SPARSE: within one clip different bones have different keyframe
+     counts AND times (walkFwdL: some bones 35, others 34/33/28, eight bones a
+     single keyframe). The old shared-timeline-by-index apply then paired each
+     bone's frame-i with the WRONG time — e.g. a bone whose 48 keyframes sit in
+     0.7-4.8s got index-clamped to its 9s end-pose and froze for the whole
+     middle of the clip. Fix: build a timeline from the UNION of all bones'
+     keyframe times and sample every bone BY TIME (bisect to its own bracketing
+     keyframes, lerp translation + slerp rotation). Highland/calf output is
+     unchanged (uniform times => exact hits, no interpolation).
+
+  2. Per-track drop instead of whole-clip skip.
+     The only tracks the decoder still mis-reads are the belly (short_intro)
+     track of the 2 adult runFwd* clips (1 of 45 tracks each — a sparse-layout
+     oddity). anim_apply now drops just that one track (the bone holds rest) and
+     keeps the clip, so runFwdL/R load and play with their other 44 bones,
+     instead of being skipped entirely. Every cattle clip now loads.
+
+Bone mapping was already correct: the .anim addresses bones by nodeId in the
+ANIMATION i3d's numbering; import_i3d builds anim_id_to_name from that file and
+resolves each track by name. Auto-detect follows <Animation externalAnimFile>
+to an EXISTING .anim and skips round-trip outputs (_fixed/_GE/_export), so it
+picks the right animations i3d even when many breeds share one differently-named
+file (every adult breed uses cattleAdultAnimations.i3d.anim).
+
+Files: importer/anim_reader.py, importer/anim_apply.py, importer/armature_builder.py
+(use_connect=False, stores source T/R/S), importer/import_i3d.py (auto-detect).
+
+Status / scope: confirmed on cattle (calf, highland, adult/angus). Other animals
+(sheep, pig, horse, ...) are untested for in-Blender playback but the decode and
+the sparse-sampling fix are format-level, so most should work; the short_intro
+bone resolution and the separate-anim-file marriage are the parts most likely to
+need a per-species check. The stock-anim round-trip via graft-i3d.bat remains a
+separate, already-solved workflow for getting a re-exported model to play in GE.
+
+
 --- Notes for future debugging --------------------------------------------
 
 When troubleshooting bone alignment:

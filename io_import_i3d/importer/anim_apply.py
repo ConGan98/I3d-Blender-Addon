@@ -31,6 +31,7 @@ their animated parent through Blender's own pose FK.
 """
 from __future__ import annotations
 
+import bisect
 from math import radians
 from typing import TYPE_CHECKING
 
@@ -75,7 +76,7 @@ def apply_animation(
     Falls back to `node_id_to_bone` (the model's own id->name).
     """
     import bpy
-    from mathutils import Matrix, Euler
+    from mathutils import Matrix, Euler, Vector
 
     stats = {"actions_built": 0, "fcurves_written": 0, "tracks_unmatched": 0,
              "keyframes_total": 0, "max_frame": 0.0}
@@ -149,33 +150,43 @@ def apply_animation(
     first_action = None
     max_frame = 0.0
 
-    def _clip_is_sane(clip) -> tuple[bool, str]:
-        """Reject clips the .i3d.anim decoder mis-read. A desynced clip parses
-        fewer tracks than `bone_count` and/or yields non-physical keyframe
-        values; binding such a clip explodes the skinned mesh. Better to skip
-        it (and say so) than to deform the model. Seen on ultra-short clips
-        (e.g. 2-frame runFwd*)."""
-        if len(clip.bone_tracks) < clip.bone_count:
-            return False, (f"{len(clip.bone_tracks)}/{clip.bone_count} tracks "
-                           f"recovered")
-        for t in clip.bone_tracks:
-            for kf in t.keyframes:
-                if any(abs(x) > 50.0 for x in kf.rotation_euler):
-                    return False, "non-physical rotation (decoder desync)"
-                if any(abs(x) > 1.0e4 for x in kf.location):
-                    return False, "non-physical translation (decoder desync)"
-        return True, ""
+    def _kfs_physical(kfs) -> bool:
+        """False if any keyframe has non-physical values — the signature of a
+        track the decoder mis-read (e.g. the belly track in the sparse 2-frame
+        adult runFwd clips). We drop just that TRACK, not the whole clip, so the
+        remaining bones still animate (the bad bone simply stays at rest)."""
+        for kf in kfs:
+            if any(abs(x) > 50.0 for x in kf.rotation_euler):
+                return False
+            if any(abs(x) > 1.0e4 for x in kf.location):
+                return False
+        return True
 
-    skipped_clips: list[str] = []
+    dropped_tracks = 0
     for clip in doc.clips:
-        sane, why = _clip_is_sane(clip)
-        if not sane:
-            skipped_clips.append(clip.name)
-            if log:
-                log.warning("anim_apply: skipping clip %r — %s; the decoder "
-                            "can't read this clip cleanly yet, so it would "
-                            "deform the mesh.", clip.name, why)
-            continue
+        # Which bone does the header-less "short_intro" track (track 0, no id)
+        # belong to? The .anim orders tracks ALPHABETICALLY by bone name and omits
+        # the id on the first one — so it's the single animated bone left uncovered
+        # by the explicit-id tracks (for cattle that's cow_belly, alphabetically
+        # first). Resolve it by elimination. (The old code sent it to the root,
+        # which then played the belly's motion and moved the whole rig "off by a
+        # node"; the root has its OWN explicit track and doesn't need this one.)
+        _covered = set()
+        for track in clip.bone_tracks:
+            if track.bone_node_id == -1:
+                continue
+            nm = (anim_id_to_name.get(track.bone_node_id) if anim_id_to_name else None)
+            if nm is None and node_id_to_bone is not None:
+                nm = node_id_to_bone.get(track.bone_node_id)
+            if nm in pbones:
+                _covered.add(nm)
+        # The .anim orders tracks alphabetically by bone name, so the header-less
+        # track 0 is the alphabetically-FIRST animated bone — i.e. the smallest
+        # uncovered bone name (for cattle: cow_belly). min() handles both the
+        # dense case (one uncovered bone) and sparse clips (several uncovered).
+        _uncovered = [bn for bn in bone_names if bn not in _covered]
+        short_intro_bone = min(_uncovered) if _uncovered else (bone_names[0] if bone_names else None)
+
         # Resolve each track to a bone name -> its keyframe list.
         anim_kfs_by_bone: dict[str, list] = {}
         for track in clip.bone_tracks:
@@ -185,8 +196,8 @@ def apply_animation(
                     bone_name = anim_id_to_name.get(track.bone_node_id)
                 if bone_name is None and node_id_to_bone is not None:
                     bone_name = node_id_to_bone.get(track.bone_node_id)
-            if bone_name is None and track.layout == "short_intro" and bone_names:
-                bone_name = bone_names[0]
+            if bone_name is None and track.layout == "short_intro":
+                bone_name = short_intro_bone
             if bone_name is None or bone_name not in pbones or bone_name in anim_kfs_by_bone:
                 stats["tracks_unmatched"] += 1
                 continue
@@ -194,45 +205,69 @@ def apply_animation(
             kfs = (track.keyframes[1:]
                    if track.layout == "short_intro" and len(track.keyframes) > 1
                    else track.keyframes)
-            if kfs:
-                anim_kfs_by_bone[bone_name] = kfs
+            if not kfs:
+                continue
+            # Skip a mis-decoded track (non-physical values) — keep the clip, that
+            # one bone just holds its rest pose.
+            if not _kfs_physical(kfs):
+                dropped_tracks += 1
+                continue
+            anim_kfs_by_bone[bone_name] = kfs
 
         if not anim_kfs_by_bone:
             continue
 
-        # Shared timeline: the longest track's sample times (GIANTS clips keyframe
-        # all bones together, so indices line up; shorter tracks clamp to last).
-        ref = max(anim_kfs_by_bone.values(), key=len)
-        times = [kf.time_ms for kf in ref]
+        # Per-bone sampling arrays: sorted times + parallel (loc, quat). Convert
+        # each keyframe's Euler to a quaternion now and keep the sequence in one
+        # hemisphere so interpolation is short-path.
+        bone_samples: dict[str, tuple] = {}
+        for bn, kfs in anim_kfs_by_bone.items():
+            ts = [kf.time_ms for kf in kfs]
+            locs = [Vector(kf.location) for kf in kfs]
+            quats = [Euler(kf.rotation_euler, 'XYZ').to_quaternion() for kf in kfs]
+            for j in range(1, len(quats)):
+                if quats[j].dot(quats[j - 1]) < 0.0:
+                    quats[j].negate()
+            bone_samples[bn] = (ts, locs, quats)
+
+        # Shared timeline = UNION of every animated bone's keyframe times. GIANTS
+        # keyframes each bone SPARSELY and INDEPENDENTLY (in one adult clip, bones
+        # can have 35, 28 or a single keyframe, at different times), so the old
+        # "index i lines up across all tracks" assumption desynced the rig. We
+        # instead sample every bone BY TIME at each timeline point (below).
+        _tset: set = set()
+        for ts, _l, _q in bone_samples.values():
+            _tset.update(ts)
+        times = sorted(_tset)
         n = len(times)
 
-        # Root re-anchor: the .i3d.anim bakes a constant bind offset into the
-        # root track's translation (e.g. Y≈-0.56) that the model's rest pose
-        # doesn't carry, so every frame shoves the whole rig off-centre. Subtract
-        # (frame-0 anim translation − rest translation) from the root each frame:
-        # frame 0 then lands exactly on rest, and real per-frame root motion is
-        # preserved relative to it. Only the root (DFS bone 0) needs this; child
-        # bones' translations already match their rest.
-        root_bn = bone_names[0] if bone_names else None
-        root_loc_offset = None
-        if root_bn in anim_kfs_by_bone:
-            kf0 = anim_kfs_by_bone[root_bn][0]
-            rest_t = _joint_local(bones[root_bn]).to_translation()
-            from mathutils import Vector
-            root_loc_offset = Vector(kf0.location) - rest_t
-
+        # No root re-anchor: the keyframes are absolute local transforms, applied
+        # as-is (exactly what GIANTS Editor does). An earlier version subtracted
+        # the first bone's frame-0 translation offset — a band-aid for the old
+        # belly→root mis-mapping — but `bone_names[0]` is the first real bone,
+        # which for the calf is calf_spine_01 (the bone that TRANSLATES the body
+        # down to lie). Re-anchoring it forced the sleep loops back to standing
+        # height and floated the animal. With the short_intro mapping fixed, no
+        # re-anchor is needed and every clip matches GE.
         def _anim_local(bn: str, i: int) -> "Matrix":
-            kfs = anim_kfs_by_bone.get(bn)
-            if kfs is None:
+            entry = bone_samples.get(bn)
+            if entry is None:
                 return _joint_local(bones[bn])          # static bone: hold rest
-            kf = kfs[i] if i < len(kfs) else kfs[-1]     # clamp short tracks
-            loc = kf.location
-            if bn == root_bn and root_loc_offset is not None:
-                loc = (loc[0] - root_loc_offset[0],
-                       loc[1] - root_loc_offset[1],
-                       loc[2] - root_loc_offset[2])
-            return (Matrix.Translation(loc)
-                    @ Euler(kf.rotation_euler, 'XYZ').to_matrix().to_4x4())
+            ts, locs, quats = entry
+            t = times[i]
+            idx = bisect.bisect_left(ts, t)
+            if idx <= 0:
+                loc, q = locs[0], quats[0]
+            elif idx >= len(ts):
+                loc, q = locs[-1], quats[-1]
+            elif ts[idx] == t:
+                loc, q = locs[idx], quats[idx]
+            else:                                        # interpolate this bone's
+                t0, t1 = ts[idx - 1], ts[idx]            # own bracketing keyframes
+                f = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+                loc = locs[idx - 1].lerp(locs[idx], f)
+                q = quats[idx - 1].slerp(quats[idx], f)
+            return Matrix.Translation(loc) @ q.to_matrix().to_4x4()
 
         action = bpy.data.actions.new(name=f"i3dAnim_{clip.name}")
         try:
@@ -305,10 +340,10 @@ def apply_animation(
         stats["actions_built"] += 1
 
     stats["max_frame"] = max_frame
-    stats["clips_skipped"] = skipped_clips
-    if skipped_clips and log:
-        log.warning("anim_apply: skipped %d unreadable clip(s): %s",
-                    len(skipped_clips), ", ".join(skipped_clips))
+    stats["tracks_dropped"] = dropped_tracks
+    if dropped_tracks and log:
+        log.info("anim_apply: dropped %d mis-decoded track(s) across clips "
+                 "(those bones hold rest; the clips still play)", dropped_tracks)
 
     if first_action is not None:
         anim_data.action = first_action

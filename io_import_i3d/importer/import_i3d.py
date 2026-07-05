@@ -144,14 +144,36 @@ def run(*, context: bpy.types.Context, filepath: str, options: dict[str, Any]) -
         # the path in double quotes, which would make .exists() fail silently.
         anim_i3d_str = (options.get('animation_i3d_path', '') or '').strip().strip('"').strip("'")
         if not anim_i3d_str:
-            # Auto-detect: a sibling animation i3d in the model's folder is any
-            # *.i3d that has a matching *.i3d.anim next to it (the model itself
-            # usually has no .anim sibling, so it won't self-match).
+            # Auto-detect the animation i3d in the model's folder. A candidate is
+            # any *.i3d (not the model, not a round-trip _fixed/_GE/_export output)
+            # that either has a same-named *.i3d.anim sibling (calf/highland case)
+            # OR references an EXISTING external anim via <Animation externalAnimFile>.
+            # The latter is essential when many breeds share one differently-named
+            # anim, e.g. every adult uses cattleAdultAnimations.i3d.anim. Prefer a
+            # name containing "anim" (the dedicated animation-reference i3d).
+            def _is_output(stem: str) -> bool:
+                s = stem.lower()
+                return s.endswith('_fixed') or s.endswith('_ge') or s.endswith('_export')
+
+            candidates = []
             for cand in sorted(path.parent.glob('*.i3d')):
-                if cand != path and cand.with_name(cand.name + '.anim').exists():
-                    anim_i3d_str = str(cand)
-                    log.info("Auto-detected animation i3d: %s", cand.name)
-                    break
+                if cand == path or _is_output(cand.stem):
+                    continue
+                if cand.with_name(cand.name + '.anim').exists():
+                    candidates.append(cand)
+                    continue
+                try:
+                    cdoc = xp.parse_i3d(cand)
+                    ext = cdoc.animation.external_file if cdoc.animation else None
+                    if ext and (cand.parent / ext).exists():
+                        candidates.append(cand)
+                except Exception:
+                    pass
+            if candidates:
+                # Prefer a dedicated animation reference (name has "anim").
+                candidates.sort(key=lambda c: (0 if 'anim' in c.stem.lower() else 1, c.name))
+                anim_i3d_str = str(candidates[0])
+                log.info("Auto-detected animation i3d: %s", candidates[0].name)
         if anim_i3d_str:
             anim_i3d_path = Path(anim_i3d_str)
             # Tolerate pointing at the .i3d.anim binary instead of the .i3d XML:

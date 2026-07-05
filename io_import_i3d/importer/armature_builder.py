@@ -388,8 +388,12 @@ def build_armature(
             if p is not None and p in name_of and name_of[p] in edit_bones:
                 parent_eb = edit_bones[name_of[p]]
                 eb.parent = parent_eb
-                if (eb.head - parent_eb.tail).length < 1e-5:
-                    eb.use_connect = True
+                # Do NOT connect bones. A connected bone's head is locked to the
+                # parent's tail, which LOCKS its pose location — but GIANTS joints
+                # animate TRANSLATION (e.g. the tongue extends in chewSource), so a
+                # connected bone would silently drop that motion. Keep every bone
+                # free to translate.
+                eb.use_connect = False
     finally:
         # Always exit EDIT mode — leaving Blender stuck in EDIT after an
         # error makes the rest of the import unusable.

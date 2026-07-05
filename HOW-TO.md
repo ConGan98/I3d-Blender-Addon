@@ -156,9 +156,11 @@ i3dio installed). Nothing to export.
 
 ## Scenario 3 — Preview the animation inside Blender
 
-> ⚠️ **Experimental / partially working.** The `.i3d.anim` format is decoded and
-> most clips play, but some clips still come out wrong. Use for a rough preview,
-> not as ground truth.
+> ✅ **Works for cattle.** The `.i3d.anim` format is fully decoded and clips play
+> correctly for calf, Highland, and adult/Angus — all clips import and match
+> GIANTS Editor. Other animals (sheep, pig, horse, water buffalo) haven't been
+> verified in-Blender yet; they're likely to work but may need a per-species
+> tweak. This is a genuine preview of the stock animation, not just a rough one.
 
 1. **File → Import → GIANTS i3d**, pick the **model** (mesh + skeleton).
 2. Options:
