@@ -1,10 +1,10 @@
 bl_info = {
     "name": "GIANTS i3d Importer",
     "author": "Conor Gannon",
-    "version": (0, 3, 0),
+    "version": (0, 3, 1),
     "blender": (4, 5, 0),
     "location": "File > Import > GIANTS i3d (.i3d)",
-    "description": "Import GIANTS Engine .i3d scenes (Farming Simulator): .i3d.shapes meshes, armature + skinning, materials, i3d attributes, and round-trip tools. Animation import is experimental.",
+    "description": "Import GIANTS Engine .i3d scenes (Farming Simulator): .i3d.shapes meshes, armature + skinning, materials, i3d attributes, and round-trip tools. In-Blender animation import works for cattle.",
     "category": "Import-Export",
     "doc_url": "",
     "tracker_url": "",
